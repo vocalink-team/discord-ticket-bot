@@ -263,29 +263,59 @@ class TicketBot(commands.Bot):
 
 
 class RequestModal(discord.ui.Modal):
-    def __init__(self, key):
+    def __init__(self, key, party_id=None):
         super().__init__(title='相談内容の入力', timeout=300)
         self.key = key
+        self.party_id = party_id if DESKS[key].urgent else None
         self.subject = discord.ui.TextInput(label='件名', max_length=150)
         self.content = discord.ui.TextInput(label='相談内容', style=discord.TextStyle.paragraph, max_length=3500)
         self.add_item(self.subject)
         self.add_item(self.content)
-        self.party = None
-        if DESKS[key].urgent:
-            self.party = discord.ui.TextInput(label='問題の当事者（1人のIDまたはメンション）', required=False, max_length=80)
-            self.add_item(self.party)
 
     async def on_submit(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             channel = await interaction.client.create_ticket(interaction, self.key, self.subject.value, self.content.value,
-                self.party.value if self.party else '')
+                str(self.party_id) if self.party_id is not None else '')
             await interaction.followup.send(f'相談窓口を作成しました：{channel.mention}', ephemeral=True)
         except (TicketError, ValueError) as exc:
             await reply(interaction, str(exc))
         except Exception as exc:
             logger.error('Ticket creation failed: %s', type(exc).__name__)
             await reply(interaction, '作成できませんでした。管理者へBOT設定の確認を依頼してください。')
+
+
+class PartySelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder='問題の当事者を1人選択', min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        try:
+            interaction.client.check_staff(interaction)
+            await interaction.response.send_modal(RequestModal('report', self.values[0].id))
+        except TicketError as exc:
+            await reply(interaction, str(exc))
+
+
+class PartyView(discord.ui.View):
+    def __init__(self, requester):
+        super().__init__(timeout=180)
+        self.requester = requester
+        self.add_item(PartySelect())
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.requester:
+            await reply(interaction, '相談を開始した本人だけが選択できます。')
+            return False
+        return True
+
+    @discord.ui.button(label='当事者を指定せずに進む', style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction, button):
+        try:
+            interaction.client.check_staff(interaction)
+            await interaction.response.send_modal(RequestModal('report'))
+        except TicketError as exc:
+            await reply(interaction, str(exc))
 
 
 class DeskSelect(discord.ui.Select):
@@ -295,7 +325,13 @@ class DeskSelect(discord.ui.Select):
     async def callback(self, interaction):
         try:
             interaction.client.check_staff(interaction)
-            await interaction.response.send_modal(RequestModal(self.values[0]))
+            key = self.values[0]
+            if DESKS[key].urgent:
+                await interaction.response.send_message(
+                    '問題の当事者を選んでください。選択後に相談内容の入力フォームが開きます。',
+                    view=PartyView(interaction.user.id), ephemeral=True)
+            else:
+                await interaction.response.send_modal(RequestModal(key))
         except TicketError as exc:
             await reply(interaction, str(exc))
 

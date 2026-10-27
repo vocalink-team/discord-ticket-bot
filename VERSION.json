@@ -1,7 +1,7 @@
 {
   "product": "VOCALINK-TEAM Discord TicketBOT",
-  "version": "v0.1.1",
+  "version": "v0.1.2",
   "updated": "2026-10-27",
   "timezone": "Asia/Tokyo",
-  "status": "test and production role routing; live server acceptance pending"
+  "status": "member picker for report party; live server acceptance pending"
 }
