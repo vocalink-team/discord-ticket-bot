@@ -33,7 +33,7 @@ class Desk:
     urgent: bool = False
 
 
-DESKS = {
+PRODUCTION_DESKS = {
     'executive': Desk('経営・重要事項（執行部）', (1562091893091733624, 1562093163567386724)),
     'staff': Desk('スタッフ・人員整理（組織運営・管理部門）', (1562093397907611728, 1562092379568087222)),
     'permissions': Desk('Discordの権限（組織運営・管理部門）', (1562092379568087222,)),
@@ -45,6 +45,27 @@ DESKS = {
     'support': Desk('利用者からの問い合わせ（サポート部門）', (1562094372311277648,)),
     'report': Desk('【第22条】ハラスメント・規則違反の相談（緊急通報）', (1562091893091733624,), True),
 }
+
+# Test IDs are explicitly supplied; never look up private routing by role name.
+TEST_ROLE_IDS = {
+    'executive': (1564583710572019734, 1564583710572019733),
+    'staff': (1564583710572019732, 1564583710563766300),
+    'permissions': (1564583710572019732,),
+    'development': (1564583710563766299,),
+    'singer': (1564583710550921256,),
+    'management': (1564583710550921257,),
+    'publicity': (1564583710550921260,),
+    'office': (1564583710550921259,),
+    'support': (1564583710550921261,),
+    'report': (1564583710572019734,),
+}
+TICKET_ENV = os.getenv('TICKET_ENV', 'production').strip().lower()
+if TICKET_ENV not in ('test', 'production'):
+    raise RuntimeError('TICKET_ENV must be test or production')
+DESKS = (PRODUCTION_DESKS if TICKET_ENV == 'production' else {
+    key: Desk(desk.label, TEST_ROLE_IDS[key], desk.urgent)
+    for key, desk in PRODUCTION_DESKS.items()
+})
 
 
 def parse_member_id(value: str) -> int | None:
