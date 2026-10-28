@@ -287,6 +287,8 @@ class TicketBot(commands.Bot):
         if not channel.permissions_for(member).view_channel:
             raise TicketError('操作する権限がありません。')
         is_owner = member.id == info['owner']
+        if is_owner and info['status'] == 'archived':
+            raise TicketError('保管済みのチケットは相談者本人から操作できません。担当部門へ依頼してください。')
         is_handler = any(r.id in DESKS[info['desk']].roles for r in member.roles)
         if (owner_only and not is_owner) or (handler and not is_handler) or not (is_owner or is_handler):
             raise TicketError('相談者または現在の担当部門だけが操作できます。')
@@ -299,6 +301,8 @@ class TicketBot(commands.Bot):
         if any(r is None or r.is_default() for r in roles):
             raise TicketError('担当ロールが見つからないため権限を変更しません。')
         owner = await guild.fetch_member(info['owner'])
+        if target['status'] == 'archived' and (owner.id == guild.owner_id or owner.guild_permissions.administrator):
+            raise TicketError('相談者が所有者または管理者のため、Discordでは非表示にできません。権限を確認するまで対応完了を中止します。')
         party = None
         if info['excluded']:
             try:
@@ -331,6 +335,11 @@ class TicketBot(commands.Bot):
             owner: allow,
         }
         overwrites.update({role: allow for role in roles})
+        if not writable:
+            # A member deny wins even if the reporter also has a handler role.
+            overwrites[owner] = discord.PermissionOverwrite(
+                view_channel=False, read_message_history=False, send_messages=False,
+                send_messages_in_threads=False, add_reactions=False)
         if info['excluded']:
             overwrites[party or discord.Object(id=info['excluded'], type=discord.Member)] = discord.PermissionOverwrite(
                 view_channel=False, read_message_history=False, send_messages=False, send_messages_in_threads=False)
@@ -462,7 +471,7 @@ class TicketBot(commands.Bot):
             or not interaction.user.guild_permissions.manage_guild):
             raise TicketError('サーバー管理権限が必要です。')
         guild = interaction.guild
-        lines = [f'実行環境：{TICKET_ENV}／v0.2.0']
+        lines = [f'実行環境：{TICKET_ENV}／v0.2.1']
         category = guild.get_channel(CATEGORY_ID)
         lines.append('カテゴリ：' + ('OK' if isinstance(category, discord.CategoryChannel) else '見つかりません'))
         if isinstance(category, discord.CategoryChannel):
@@ -622,7 +631,7 @@ class CloseView(discord.ui.View):
     async def close_ticket(self, interaction, button):
         try:
             interaction.client.authorize_close(interaction)
-            await interaction.response.send_message('対応を完了し、投稿を停止して保管しますか？内容は残り、後で再開できます。',
+            await interaction.response.send_message('対応を完了し、相談者から非表示にして保管しますか？担当部門は閲覧でき、後で再開できます。',
                 view=ConfirmClose(interaction.user.id), ephemeral=True)
         except TicketError as exc:
             await reply(interaction, str(exc))
@@ -775,7 +784,7 @@ class ConfirmClose(discord.ui.View):
             async with bot.close_lock:
                 await bot.change_archive(interaction, True)
                 self.stop()
-                await reply(interaction, '対応完了として保管しました。再開ボタンから投稿を再開できます。')
+                await reply(interaction, '対応完了として相談者から非表示にして保管しました。再開は担当部門が操作してください。')
         await workflow_reply(interaction, action)
 
     @discord.ui.button(label='キャンセル', style=discord.ButtonStyle.secondary)

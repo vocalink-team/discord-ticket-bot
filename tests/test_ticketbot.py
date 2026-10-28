@@ -93,15 +93,16 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_archive_read_only_reopen_exclusion_persists(self):
         await self.bot.change_archive(self.interaction(), True)
         self.assertEqual(self.bot.store.info(CID)['status'], 'archived')
-        for uid in (OWNER, HANDLER):
+        for uid in (HANDLER,):
             perms = self.channel.permissions_for(self.members[uid])
             self.assertTrue(perms.view_channel)
             self.assertFalse(perms.send_messages)
             self.assertFalse(perms.send_messages_in_threads)
         self.assertFalse(self.channel.permissions_for(self.members[PARTY]).view_channel)
         self.assertFalse(self.channel.permissions_for(self.members[OTHER]).view_channel)
+        self.assertFalse(self.channel.permissions_for(self.members[OWNER]).view_channel)
         self.delete.assert_not_awaited()
-        await self.bot.change_archive(self.interaction(), False)
+        await self.bot.change_archive(self.interaction(HANDLER), False)
         self.assertEqual(self.bot.store.info(CID)['status'], 'waiting')
         self.assertTrue(self.channel.permissions_for(self.members[OWNER]).send_messages)
         self.assertFalse(self.channel.permissions_for(self.members[PARTY]).view_channel)
@@ -192,7 +193,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_reopen_enforces_quota(self):
         self.bot.store.update(CID, status='archived')
         for n in range(m.MAX_OPEN): self.bot.store.add(5000+n, OWNER, 'development', None)
-        with self.assertRaises(m.TicketError): await self.bot.change_archive(self.interaction(), False)
+        with self.assertRaises(m.TicketError): await self.bot.change_archive(self.interaction(HANDLER), False)
 
     async def test_missing_destination_role_never_grants_access(self):
         self.guild._roles.pop(m.DESKS['development'].roles[0])
@@ -202,19 +203,19 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delete_requires_archived_and_does_not_delete_after_reopen(self):
         rev = self.bot.store.info(CID)['revision']
-        confirm = m.ConfirmDelete(OWNER, rev)
-        await confirm.confirm.callback(self.interaction())
+        confirm = m.ConfirmDelete(HANDLER, rev)
+        await confirm.confirm.callback(self.interaction(HANDLER))
         self.delete.assert_not_awaited()
         await self.bot.change_archive(self.interaction(), True)
-        confirm = m.ConfirmDelete(OWNER, self.bot.store.info(CID)['revision'])
-        await self.bot.change_archive(self.interaction(), False)
-        await confirm.confirm.callback(self.interaction())
+        confirm = m.ConfirmDelete(HANDLER, self.bot.store.info(CID)['revision'])
+        await self.bot.change_archive(self.interaction(HANDLER), False)
+        await confirm.confirm.callback(self.interaction(HANDLER))
         self.delete.assert_not_awaited()
 
     async def test_delete_archived_sensitive_never_exports(self):
         await self.bot.change_archive(self.interaction(), True)
-        confirm = m.ConfirmDelete(OWNER, self.bot.store.info(CID)['revision'])
-        await confirm.confirm.callback(self.interaction())
+        confirm = m.ConfirmDelete(HANDLER, self.bot.store.info(CID)['revision'])
+        await confirm.confirm.callback(self.interaction(HANDLER))
         self.delete.assert_awaited_once()
         self.assertIsNone(self.bot.store.info(CID))
 
@@ -231,9 +232,9 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_log_failure_prevents_permanent_deletion(self):
         self.bot.store.update(CID, desk='development', sensitive=0)
         await self.bot.change_archive(self.interaction(), True)
-        confirm = m.ConfirmDelete(OWNER, self.bot.store.info(CID)['revision'])
+        confirm = m.ConfirmDelete(HANDLER, self.bot.store.info(CID)['revision'])
         with patch.object(self.bot, 'transcript', AsyncMock(side_effect=m.TicketError('log unavailable'))):
-            await confirm.confirm.callback(self.interaction())
+            await confirm.confirm.callback(self.interaction(HANDLER))
         self.delete.assert_not_awaited()
         self.assertIsNotNone(self.bot.store.info(CID))
 
@@ -268,6 +269,32 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_wrong_guild_rejected(self):
         i = self.interaction(); i.guild_id = 999
         with self.assertRaises(m.TicketError): await self.bot.fresh_ticket(i)
+
+    async def test_archived_reporter_with_handler_role_is_denied(self):
+        self.members[OWNER]._roles = discord.utils.SnowflakeList(m.DESKS['report'].roles)
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.assertFalse(self.channel.permissions_for(self.members[OWNER]).view_channel)
+        self.assertTrue(self.channel.permissions_for(self.members[HANDLER]).view_channel)
+        with self.assertRaises(m.TicketError):
+            await self.bot.change_archive(self.interaction(), False)
+        with self.assertRaises(m.TicketError):
+            await self.bot.fresh_ticket(self.interaction())
+        await self.bot.change_archive(self.interaction(HANDLER), False)
+        self.assertTrue(self.channel.permissions_for(self.members[OWNER]).view_channel)
+        self.assertFalse(self.channel.permissions_for(self.members[PARTY]).view_channel)
+
+    async def test_administrator_reporter_cannot_be_marked_hidden(self):
+        self.members[OWNER]._roles = discord.utils.SnowflakeList([300])
+        self.guild.get_role(300)._permissions |= discord.Permissions(administrator=True).value
+        with self.assertRaises(m.TicketError):
+            await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.assertEqual(self.bot.store.info(CID)['status'], 'waiting')
+
+    async def test_server_owner_reporter_cannot_be_marked_hidden(self):
+        self.guild.owner_id = OWNER
+        with self.assertRaises(m.TicketError):
+            await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.assertEqual(self.bot.store.info(CID)['status'], 'waiting')
 
     async def test_settings_check_not_available_to_staff(self):
         with self.assertRaises(m.TicketError): await self.bot.config_check(self.interaction(OTHER))
