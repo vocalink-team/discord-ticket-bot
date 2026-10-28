@@ -218,6 +218,23 @@ class TicketBot(commands.Bot):
             self.store.db.execute('UPDATE tickets SET notes_channel=NULL WHERE notes_channel=?', (channel.id,))
             self.store.db.commit()
 
+    async def on_guild_channel_update(self, before, after):
+        if after.guild.id != GUILD_ID or before.name == after.name:
+            return
+        async with self.close_lock:
+            info = self.store.info(after.id)
+            if not info or not info['notes_channel']:
+                return
+            try:
+                # Fetch the latest name so delayed events cannot undo a later rename.
+                channel = await after.guild.fetch_channel(after.id)
+                notes = await after.guild.fetch_channel(info['notes_channel'])
+                if notes.name != channel.name:
+                    await notes.edit(name=channel.name, reason='Match staff channel to ticket name')
+            except discord.HTTPException as exc:
+                logger.error('Staff channel rename failed: %s status=%s code=%s',
+                             type(exc).__name__, exc.status, exc.code)
+
     def check_staff(self, interaction):
         if interaction.guild_id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not staff(interaction.user):
             raise TicketError('この窓口は指定サーバーのスタッフ専用です。')
@@ -351,13 +368,13 @@ class TicketBot(commands.Bot):
             overwrites = await self.notes_overwrites(channel.guild, info, target)
             if info['notes_channel']:
                 notes = await channel.guild.fetch_channel(info['notes_channel'])
-                notes = await notes.edit(overwrites=overwrites, reason='Verify staff ticket access')
+                notes = await notes.edit(name=channel.name, overwrites=overwrites, reason='Verify staff ticket access')
                 self.store.audit(channel.id, member.id, 'notes_opened')
             else:
                 category = channel.category or channel.guild.get_channel(CATEGORY_ID)
                 if not isinstance(category, discord.CategoryChannel):
                     raise TicketError('内部メモ作成先のカテゴリが見つかりません。')
-                notes = await channel.guild.create_text_channel('staff-' + os.urandom(4).hex(),
+                notes = await channel.guild.create_text_channel(channel.name,
                     category=category, overwrites=overwrites, reason='Private ticket staff notes')
                 try:
                     self.store.update(channel.id, notes_channel=notes.id, actor=member.id, event='notes_created')
@@ -550,7 +567,7 @@ class TicketBot(commands.Bot):
             notes_overwrites = await self.notes_overwrites(channel.guild, info, target)
         self.store.update(channel.id, status='updating', pending=json.dumps(target), actor=actor, event='transition_requested')
         if notes:
-            await notes.edit(overwrites=notes_overwrites, reason='Staff ticket permissions update')
+            await notes.edit(name=channel.name, overwrites=notes_overwrites, reason='Staff ticket permissions update')
         updated = await channel.edit(overwrites=overwrites, reason='Ticket workflow permission update')
         event = 'transferred' if target['desk'] != info['desk'] else ('archived' if target['status'] == 'archived' else 'reopened')
         self.store.update(channel.id, **target, pending=None, actor=actor, event=event)
@@ -682,7 +699,7 @@ class TicketBot(commands.Bot):
             or not interaction.user.guild_permissions.manage_guild):
             raise TicketError('サーバー管理権限が必要です。')
         guild = interaction.guild
-        lines = [f'実行環境：{TICKET_ENV}／v0.3.0']
+        lines = [f'実行環境：{TICKET_ENV}／v0.3.1']
         category = guild.get_channel(CATEGORY_ID)
         lines.append('カテゴリ：' + ('OK' if isinstance(category, discord.CategoryChannel) else '見つかりません'))
         if isinstance(category, discord.CategoryChannel):

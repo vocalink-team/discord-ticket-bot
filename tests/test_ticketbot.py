@@ -55,7 +55,10 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         async def fetch_members(guild, **kwargs):
             for member in self.members.values(): yield member
         async def edit(channel, **kwargs):
-            self.set_overwrites(kwargs['overwrites'], channel)
+            if 'overwrites' in kwargs:
+                self.set_overwrites(kwargs['overwrites'], channel)
+            if 'name' in kwargs:
+                channel.name = kwargs['name']
             return channel
         self.start(patch.object(discord.Guild, 'fetch_member', fetch_member))
         self.start(patch.object(discord.Guild, 'fetch_channel', fetch_channel))
@@ -442,8 +445,11 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.setup_staff_channel_api()
         await self.bot.staff_notes(self.interaction(HANDLER))
         first = self.bot.store.info(CID)['notes_channel']
+        self.assertEqual(self.guild.get_channel(first).name, self.channel.name)
+        self.guild.get_channel(first).name = 'legacy-staff-name'
         await self.bot.staff_notes(self.interaction(HANDLER))
         self.assertEqual(self.bot.store.info(CID)['notes_channel'], first)
+        self.assertEqual(self.guild.get_channel(first).name, self.channel.name)
         events = [r[0] for r in self.bot.store.db.execute('SELECT event FROM ticket_audit WHERE ticket=?', (CID,))]
         self.assertEqual(events.count('notes_created'), 1)
         self.assertEqual(events.count('notes_opened'), 1)
@@ -484,6 +490,22 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             channel = await self.bot.create_ticket(self.interaction(), 'development', 'fictional', 'fictional', '')
         self.assertGreater(self.bot.store.cooldown_remaining(OWNER), 0)
         self.assertEqual(self.bot.store.db.execute('SELECT actor,event FROM ticket_audit WHERE ticket=?', (channel.id,)).fetchone(), (OWNER, 'created'))
+
+    async def test_staff_channel_tracks_latest_ticket_name_without_access_change(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        notes = self.guild.get_channel(self.bot.store.info(CID)['notes_channel'])
+        before = NS(name=self.channel.name)
+        self.channel.name = 'ticket-renamed'
+        await self.bot.on_guild_channel_update(before, self.channel)
+        self.assertEqual(notes.name, 'ticket-renamed')
+        self.assertTrue(notes.permissions_for(self.members[HANDLER]).view_channel)
+        self.assertFalse(notes.permissions_for(self.members[OWNER]).view_channel)
+        self.assertFalse(notes.permissions_for(self.members[PARTY]).view_channel)
+        # Renaming the internal channel does not rename the source ticket.
+        notes.name = 'staff-manual-name'
+        await self.bot.on_guild_channel_update(NS(name='ticket-renamed'), notes)
+        self.assertEqual(self.channel.name, 'ticket-renamed')
 
     async def test_settings_check_not_available_to_staff(self):
         with self.assertRaises(m.TicketError): await self.bot.config_check(self.interaction(OTHER))
