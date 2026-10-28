@@ -1,7 +1,7 @@
 {
   "product": "VOCALINK-TEAM Discord TicketBOT",
-  "version": "v0.3.1",
+  "version": "v0.3.2",
   "updated": "2026-10-28",
   "timezone": "Asia/Tokyo",
-  "status": "staff channel names match ticket; offline tests passed; live acceptance pending"
+  "status": "phase 05 and 06 accepted by user report; phase 07 operations started; documentation-only release"
 }
