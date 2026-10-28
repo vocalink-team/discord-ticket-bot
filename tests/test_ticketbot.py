@@ -47,12 +47,16 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.guild._channels[CID] = self.channel
         self.patches = []
         async def fetch_member(guild, uid): return self.members[uid]
-        async def fetch_channel(guild, cid): return self.channel
+        async def fetch_channel(guild, cid):
+            channel = guild.get_channel(cid)
+            if channel is None:
+                raise discord.NotFound(NS(status=404, reason='Not Found'), {'code': 10003, 'message': 'Unknown Channel'})
+            return channel
         async def fetch_members(guild, **kwargs):
             for member in self.members.values(): yield member
         async def edit(channel, **kwargs):
-            self.set_overwrites(kwargs['overwrites'])
-            return self.channel
+            self.set_overwrites(kwargs['overwrites'], channel)
+            return channel
         self.start(patch.object(discord.Guild, 'fetch_member', fetch_member))
         self.start(patch.object(discord.Guild, 'fetch_channel', fetch_channel))
         self.start(patch.object(discord.Guild, 'fetch_members', fetch_members))
@@ -67,13 +71,13 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.patches.append(p)
         return p.start()
 
-    def set_overwrites(self, overwrites):
+    def set_overwrites(self, overwrites, channel=None):
         data = []
         for target, overwrite in overwrites.items():
             allow, deny = overwrite.pair()
             data.append({'id': str(target.id), 'type': 0 if isinstance(target, discord.Role) else 1,
                          'allow': str(allow.value), 'deny': str(deny.value)})
-        self.channel._fill_overwrites({'permission_overwrites': data})
+        (channel or self.channel)._fill_overwrites({'permission_overwrites': data})
 
     def target(self, **extra):
         return dict(status='waiting', desk='report', sensitive=1, assignee=None,
@@ -110,7 +114,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_claim_and_release(self):
         await self.bot.claim(self.interaction(HANDLER))
         self.assertEqual(self.bot.store.info(CID)['assignee'], HANDLER)
-        await self.bot.claim(self.interaction(HANDLER))
+        await self.bot.claim(self.interaction(HANDLER), release=True)
         self.assertEqual(self.bot.store.info(CID)['status'], 'waiting')
         self.assertIsNone(self.bot.store.info(CID)['assignee'])
         with self.assertRaises(m.TicketError): await self.bot.claim(self.interaction(OTHER))
@@ -221,7 +225,9 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_persistent_controls_and_picker(self):
         self.assertTrue(m.CloseView().is_persistent())
-        self.assertEqual(len(m.CloseView().children), 5)
+        self.assertEqual(len(m.CloseView().children), 3)
+        self.assertTrue(m.LegacyControls().is_persistent())
+        self.assertEqual([c.label for c in m.CloseView().children], ['担当する', '担当者用パネル', 'チケットを閉じる'])
         self.assertEqual(len(m.RequestModal('report', PARTY).children), 2)
         view = m.PartyView(OWNER)
         self.assertFalse(await view.interaction_check(self.interaction(OTHER)))
@@ -295,6 +301,189 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(m.TicketError):
             await self.bot.change_archive(self.interaction(HANDLER), True)
         self.assertEqual(self.bot.store.info(CID)['status'], 'waiting')
+
+    def setup_staff_channel_api(self):
+        category = discord.CategoryChannel(state=self.bot._connection, guild=self.guild,
+            data={'id':'200', 'name':'tickets', 'type':4, 'position':0, 'permission_overwrites':[]})
+        self.guild._channels[200] = category
+        async def create(guild, name, **kwargs):
+            notes = discord.TextChannel(state=self.bot._connection, guild=guild,
+                data={'id':'12000', 'name':name, 'type':0, 'position':0, 'parent_id':'200', 'permission_overwrites':[]})
+            self.set_overwrites(kwargs['overwrites'], notes)
+            guild._channels[notes.id] = notes
+            return notes
+        self.start(patch.object(discord.Guild, 'create_text_channel', create))
+
+    async def test_staff_channel_denies_reporter_and_party_even_with_handler_role(self):
+        self.setup_staff_channel_api()
+        self.members[OWNER]._roles = discord.utils.SnowflakeList(m.DESKS['report'].roles)
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        notes = self.guild.get_channel(self.bot.store.info(CID)['notes_channel'])
+        self.assertTrue(notes.permissions_for(self.members[HANDLER]).view_channel)
+        for uid in (OWNER, PARTY, OTHER):
+            self.assertFalse(notes.permissions_for(self.members[uid]).view_channel)
+        with self.assertRaises(m.TicketError):
+            await self.bot.staff_notes(self.interaction(OWNER))
+
+    async def test_internal_notes_follow_archive_reopen_and_approved_transfer(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        notes = self.guild.get_channel(self.bot.store.info(CID)['notes_channel'])
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.assertFalse(notes.permissions_for(self.members[HANDLER]).send_messages)
+        self.assertFalse(notes.permissions_for(self.members[OWNER]).view_channel)
+        await self.bot.change_archive(self.interaction(HANDLER), False)
+        self.assertTrue(notes.permissions_for(self.members[HANDLER]).send_messages)
+        self.members[OTHER]._roles = discord.utils.SnowflakeList(m.DESKS['development'].roles)
+        self.members[HANDLER]._roles = discord.utils.SnowflakeList(m.DESKS['report'].roles)
+        rev = self.bot.store.info(CID)['revision']
+        await self.bot.approve_transfer(self.interaction(), rev, 'development')
+        self.assertTrue(notes.permissions_for(self.members[OTHER]).view_channel)
+        for uid in (OWNER, PARTY, HANDLER):
+            self.assertFalse(notes.permissions_for(self.members[uid]).view_channel)
+
+    async def test_internal_notes_api_failure_keeps_recoverable_transition(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        with patch.object(discord.TextChannel, 'edit', AsyncMock(side_effect=OSError('offline'))):
+            with self.assertRaises(OSError): await self.bot.change_archive(self.interaction(HANDLER), True)
+        info = self.bot.store.info(CID)
+        self.assertEqual(info['status'], 'updating')
+        await self.bot.apply_transition(self.channel, info, json.loads(info['pending']))
+        notes = self.guild.get_channel(info['notes_channel'])
+        self.assertFalse(notes.permissions_for(self.members[OWNER]).view_channel)
+        self.assertEqual(self.bot.store.info(CID)['status'], 'archived')
+
+    async def test_staff_panel_rejects_reporter_outsider_and_excluded_member(self):
+        for uid in (OWNER, OTHER, PARTY):
+            with self.assertRaises(m.TicketError): await self.bot.staff_ticket(self.interaction(uid))
+        panel = m.StaffPanel(HANDLER)
+        self.assertFalse(await panel.interaction_check(self.interaction(OTHER)))
+        self.assertTrue(await panel.interaction_check(self.interaction(HANDLER)))
+        self.members[HANDLER]._roles = discord.utils.SnowflakeList([])
+        self.assertFalse(await panel.interaction_check(self.interaction(HANDLER)))
+
+    async def test_assignment_changes_only_to_current_eligible_handler(self):
+        self.members[OTHER]._roles = discord.utils.SnowflakeList(m.DESKS['report'].roles)
+        await self.bot.assign_member(self.interaction(HANDLER), OTHER)
+        self.assertEqual(self.bot.store.info(CID)['assignee'], OTHER)
+        self.assertEqual(self.bot.store.info(CID)['status'], 'active')
+        for uid in (OWNER, PARTY, BOT):
+            with self.assertRaises(m.TicketError): await self.bot.assign_member(self.interaction(HANDLER), uid)
+        with self.assertRaises(m.TicketError): await self.bot.assign_member(self.interaction(OWNER), HANDLER)
+
+    async def test_staff_panel_status_revalidates_membership(self):
+        self.members[HANDLER]._roles = discord.utils.SnowflakeList([])
+        i = self.interaction(HANDLER)
+        await m.staff_action(i, 'status')
+        self.assertIn('権限', i.followup.send.call_args.args[0])
+
+    async def test_cooldown_survives_ticket_deletion_and_blocks_creation(self):
+        self.setup_staff_channel_api()
+        self.bot.store.created_now(OWNER)
+        self.bot.store.remove(CID)
+        self.assertGreater(self.bot.store.cooldown_remaining(OWNER), 0)
+        with patch.object(discord.CategoryChannel, 'permissions_for', return_value=discord.Permissions.all()):
+            with self.assertRaisesRegex(m.TicketError, '連続作成'):
+                await self.bot.create_ticket(self.interaction(), 'development', 'fictional', 'fictional', '')
+
+    async def test_retention_notice_requires_archived_and_never_deletes(self):
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.bot.store.update(CID, archived_at=1, retention_notified=0)
+        self.send.reset_mock()
+        await self.bot.retention_once()
+        self.send.assert_awaited_once()
+        recipients = self.send.call_args.kwargs['allowed_mentions'].users
+        self.assertEqual([u.id for u in recipients], [HANDLER])
+        self.delete.assert_not_awaited()
+        await self.bot.retention_once()
+        self.send.assert_awaited_once()
+
+    async def test_audit_records_metadata_including_completed_and_reopened(self):
+        await self.bot.claim(self.interaction(HANDLER))
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        await self.bot.change_archive(self.interaction(HANDLER), False)
+        events = self.bot.store.db.execute('SELECT actor,event FROM ticket_audit WHERE ticket=?', (CID,)).fetchall()
+        self.assertIn((HANDLER, 'claimed'), events)
+        self.assertIn((HANDLER, 'archived'), events)
+        self.assertIn((HANDLER, 'reopened'), events)
+        columns = {r[1] for r in self.bot.store.db.execute('PRAGMA table_info(ticket_audit)')}
+        self.assertEqual(columns, {'id','ticket','at','actor','event','desk','subject_id'})
+        await self.bot.show_audit(self.interaction(HANDLER))
+        with self.assertRaises(m.TicketError): await self.bot.show_audit(self.interaction(OWNER))
+
+    async def test_internal_notes_deleted_with_ticket_and_audit_retained(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        confirm = m.ConfirmDelete(HANDLER, self.bot.store.info(CID)['revision'])
+        await confirm.confirm.callback(self.interaction(HANDLER))
+        self.assertEqual(self.delete.await_count, 2)
+        self.assertIsNone(self.bot.store.info(CID))
+        self.assertEqual(self.bot.store.db.execute('SELECT COUNT(*) FROM orphan_notes').fetchone()[0], 0)
+        self.assertGreater(self.bot.store.db.execute('SELECT COUNT(*) FROM ticket_audit WHERE ticket=?', (CID,)).fetchone()[0], 0)
+
+    async def test_orphan_staff_notes_queued_and_cleaned(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        self.bot.store.remove(CID)
+        self.assertEqual(self.bot.store.db.execute('SELECT COUNT(*) FROM orphan_notes').fetchone()[0], 1)
+        await self.bot.cleanup_orphan_notes()
+        self.delete.assert_awaited_once()
+        self.assertEqual(self.bot.store.db.execute('SELECT COUNT(*) FROM orphan_notes').fetchone()[0], 0)
+
+    async def test_admin_reporter_blocks_internal_notes_creation(self):
+        self.setup_staff_channel_api()
+        self.guild.owner_id = OWNER
+        with self.assertRaises(m.TicketError): await self.bot.staff_notes(self.interaction(HANDLER))
+        self.assertIsNone(self.bot.store.info(CID)['notes_channel'])
+
+    async def test_internal_notes_are_reused(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        first = self.bot.store.info(CID)['notes_channel']
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        self.assertEqual(self.bot.store.info(CID)['notes_channel'], first)
+        events = [r[0] for r in self.bot.store.db.execute('SELECT event FROM ticket_audit WHERE ticket=?', (CID,))]
+        self.assertEqual(events.count('notes_created'), 1)
+        self.assertEqual(events.count('notes_opened'), 1)
+
+    async def test_internal_notes_delete_failure_prevents_main_deletion(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.delete.side_effect = OSError('offline')
+        confirm = m.ConfirmDelete(HANDLER, self.bot.store.info(CID)['revision'])
+        await confirm.confirm.callback(self.interaction(HANDLER))
+        self.assertEqual(self.delete.await_count, 1)
+        self.assertIsNotNone(self.bot.store.info(CID)['notes_channel'])
+        self.assertIsNotNone(self.bot.store.info(CID))
+
+    async def test_orphan_cleanup_failure_keeps_retry_record(self):
+        self.setup_staff_channel_api()
+        await self.bot.staff_notes(self.interaction(HANDLER))
+        self.bot.store.remove(CID)
+        self.delete.side_effect = OSError('offline')
+        await self.bot.cleanup_orphan_notes()
+        self.assertEqual(self.bot.store.db.execute('SELECT COUNT(*) FROM orphan_notes').fetchone()[0], 1)
+
+    async def test_retention_and_cooldown_can_be_disabled(self):
+        await self.bot.change_archive(self.interaction(HANDLER), True)
+        self.bot.store.update(CID, archived_at=1)
+        self.send.reset_mock()
+        with patch.object(m, 'RETENTION_DAYS', 0):
+            await self.bot.retention_once()
+        self.send.assert_not_awaited()
+        self.bot.store.created_now(OWNER)
+        with patch.object(m, 'COOLDOWN_SECONDS', 0):
+            self.assertEqual(self.bot.store.cooldown_remaining(OWNER), 0)
+
+    async def test_successful_create_records_audit_and_cooldown(self):
+        self.setup_staff_channel_api()
+        with patch.object(discord.CategoryChannel, 'permissions_for', return_value=discord.Permissions.all()):
+            channel = await self.bot.create_ticket(self.interaction(), 'development', 'fictional', 'fictional', '')
+        self.assertGreater(self.bot.store.cooldown_remaining(OWNER), 0)
+        self.assertEqual(self.bot.store.db.execute('SELECT actor,event FROM ticket_audit WHERE ticket=?', (channel.id,)).fetchone(), (OWNER, 'created'))
 
     async def test_settings_check_not_available_to_staff(self):
         with self.assertRaises(m.TicketError): await self.bot.config_check(self.interaction(OTHER))

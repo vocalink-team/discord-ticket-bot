@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -22,6 +23,10 @@ LOG_ID = int(os.getenv('TICKET_LOG_CHANNEL_ID', '0'))
 DB_PATH = os.getenv('TICKET_DB_PATH', 'tickets.sqlite3')
 MAX_OPEN = int(os.getenv('MAX_OPEN_TICKETS', '3'))
 REMIND_MINUTES = int(os.getenv('TICKET_REMIND_MINUTES', '60'))
+COOLDOWN_SECONDS = int(os.getenv('TICKET_COOLDOWN_SECONDS', '60'))
+RETENTION_DAYS = int(os.getenv('TICKET_RETENTION_DAYS', '30'))
+if COOLDOWN_SECONDS < 0 or RETENTION_DAYS < 0:
+    raise RuntimeError('Cooldown and retention must be >= 0')
 if REMIND_MINUTES < 0:
     raise RuntimeError('TICKET_REMIND_MINUTES must be >= 0')
 STATE_LABELS = {'waiting': '未対応', 'active': '対応中', 'archived': '完了・保管中', 'updating': '権限更新の確認待ち'}
@@ -104,9 +109,15 @@ class Store:
             'notified_at': 'REAL NOT NULL DEFAULT 0',
             'revision': 'INTEGER NOT NULL DEFAULT 0',
             'sensitive': 'INTEGER NOT NULL DEFAULT 0', 'pending': 'TEXT',
+            'notes_channel': 'INTEGER', 'archived_at': 'REAL NOT NULL DEFAULT 0',
+            'retention_notified': 'REAL NOT NULL DEFAULT 0',
         }.items():
             if name not in columns:
                 self.db.execute(f'ALTER TABLE tickets ADD COLUMN {name} {definition}')
+        self.db.execute('CREATE TABLE IF NOT EXISTS ticket_audit (id INTEGER PRIMARY KEY, ticket INTEGER NOT NULL, at REAL NOT NULL, actor INTEGER, event TEXT NOT NULL, desk TEXT, subject_id INTEGER)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS creation_cooldowns (owner INTEGER PRIMARY KEY, at REAL NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS orphan_notes (channel INTEGER PRIMARY KEY, ticket INTEGER NOT NULL)')
+        self.db.execute("UPDATE tickets SET archived_at=? WHERE status='archived' AND archived_at=0", (time.time(),))
         self.db.execute('UPDATE tickets SET created_at=? WHERE created_at=0', (time.time(),))
         self.db.execute("UPDATE tickets SET sensitive=1 WHERE desk='report'")
         self.db.commit()
@@ -117,12 +128,38 @@ class Store:
         self.db.row_factory = None
         return dict(row) if row else None
 
-    def update(self, cid, **fields):
-        allowed = {'status', 'assignee', 'created_at', 'notified_at', 'sensitive', 'desk', 'pending'}
+    def update(self, cid, *, actor=None, event=None, subject_id=None, **fields):
+        allowed = {'status', 'assignee', 'created_at', 'notified_at', 'sensitive', 'desk', 'pending',
+                   'notes_channel', 'archived_at', 'retention_notified'}
         if not fields or not set(fields) <= allowed:
             raise ValueError('Invalid ticket update')
         sql = ','.join(f'{key}=?' for key in fields)
         self.db.execute(f'UPDATE tickets SET {sql},revision=revision+1 WHERE channel=?', (*fields.values(), cid))
+        if event:
+            self._audit(cid, actor, event, fields.get('desk'), subject_id)
+        self.db.commit()
+
+    def _audit(self, cid, actor, event, desk=None, subject_id=None):
+        # Metadata only; no free-form payload, message, title, or note text.
+        events = {'created', 'claimed', 'released', 'assigned', 'transition_requested',
+                  'transition_applied', 'transfer_proposed', 'transfer_rejected',
+                  'notes_created', 'notes_opened', 'delete_requested', 'deleted', 'archived', 'reopened', 'transferred',
+                  'channel_removed', 'retention_notice', 'notes_deleted'}
+        if event not in events or (desk is not None and desk not in DESKS):
+            raise ValueError('Invalid audit metadata')
+        self.db.execute('INSERT INTO ticket_audit (ticket,at,actor,event,desk,subject_id) VALUES (?,?,?,?,?,?)',
+                        (cid, time.time(), actor, event, desk, subject_id))
+
+    def audit(self, cid, actor, event, desk=None, subject_id=None):
+        self._audit(cid, actor, event, desk, subject_id)
+        self.db.commit()
+
+    def cooldown_remaining(self, owner):
+        row = self.db.execute('SELECT at FROM creation_cooldowns WHERE owner=?', (owner,)).fetchone()
+        return max(0, int(row[0] + COOLDOWN_SECONDS - time.time()) + 1) if row and COOLDOWN_SECONDS else 0
+
+    def created_now(self, owner):
+        self.db.execute('INSERT OR REPLACE INTO creation_cooldowns VALUES (?,?)', (owner, time.time()))
         self.db.commit()
 
     def get(self, cid):
@@ -134,6 +171,9 @@ class Store:
         self.db.commit()
 
     def remove(self, cid):
+        info = self.info(cid)
+        if info and info['notes_channel']:
+            self.db.execute('INSERT OR IGNORE INTO orphan_notes VALUES (?,?)', (info['notes_channel'], cid))
         self.db.execute('DELETE FROM tickets WHERE channel=?', (cid,))
         self.db.commit()
 
@@ -158,9 +198,9 @@ class TicketBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(PanelView())
         self.add_view(CloseView())
+        self.add_view(LegacyControls())
         await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-        if REMIND_MINUTES:
-            self.reminders.start()
+        self.reminders.start()
 
     async def close(self):
         self.reminders.cancel()
@@ -172,7 +212,11 @@ class TicketBot(commands.Bot):
 
     async def on_guild_channel_delete(self, channel):
         if channel.guild.id == GUILD_ID:
-            self.store.remove(channel.id)
+            if self.store.info(channel.id):
+                self.store.audit(channel.id, None, 'channel_removed')
+                self.store.remove(channel.id)
+            self.store.db.execute('UPDATE tickets SET notes_channel=NULL WHERE notes_channel=?', (channel.id,))
+            self.store.db.commit()
 
     def check_staff(self, interaction):
         if interaction.guild_id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not staff(interaction.user):
@@ -227,6 +271,9 @@ class TicketBot(commands.Bot):
             if not eligible:
                 raise TicketError('当事者以外の対応担当者が確認できないため作成を中止しました。別の安全な相談経路を使用してください。')
         async with self.create_lock:
+            remaining = self.store.cooldown_remaining(interaction.user.id)
+            if remaining:
+                raise TicketError(f'連続作成を制限しています。あと{remaining}秒待ってください。')
             open_rows = self.store.db.execute('SELECT channel FROM tickets WHERE owner=? AND status != \'archived\'', (interaction.user.id,)).fetchall()
             count = 0
             for (cid,) in open_rows:
@@ -272,7 +319,154 @@ class TicketBot(commands.Bot):
                 except discord.HTTPException:
                     pass  # Persisted record permits later manual cleanup. Never post contents to logs.
                 raise
+            self.store.created_now(interaction.user.id)
+            self.store.audit(channel.id, interaction.user.id, 'created', key)
             return channel
+
+    async def staff_ticket(self, interaction):
+        channel, member, info = await self.fresh_ticket(interaction, handler=True)
+        if member.id == info['owner']:
+            raise TicketError('担当者用パネルは相談者本人以外の担当部門が利用できます。')
+        return channel, member, info
+
+    async def notes_overwrites(self, guild, info, target):
+        owner = await guild.fetch_member(info['owner'])
+        if owner.id == guild.owner_id or owner.guild_permissions.administrator:
+            raise TicketError('相談者が所有者または管理者のため、内部メモを非公開にできません。')
+        # Use the same owner/excluded member denies as an archived ticket.
+        overwrites = await self.routing_overwrites(guild, info, dict(target, status='archived'))
+        for rid in DESKS[target['desk']].roles:
+            role = guild.get_role(rid)
+            if target['status'] != 'archived':
+                overwrites[role].send_messages = True
+                overwrites[role].attach_files = True
+                overwrites[role].embed_links = True
+                overwrites[role].add_reactions = True
+        return overwrites
+
+    async def staff_notes(self, interaction):
+        async with self.close_lock:
+            channel, member, info = await self.staff_ticket(interaction)
+            target = dict(status=info['status'], desk=info['desk'], sensitive=info['sensitive'])
+            overwrites = await self.notes_overwrites(channel.guild, info, target)
+            if info['notes_channel']:
+                notes = await channel.guild.fetch_channel(info['notes_channel'])
+                notes = await notes.edit(overwrites=overwrites, reason='Verify staff ticket access')
+                self.store.audit(channel.id, member.id, 'notes_opened')
+            else:
+                category = channel.category or channel.guild.get_channel(CATEGORY_ID)
+                if not isinstance(category, discord.CategoryChannel):
+                    raise TicketError('内部メモ作成先のカテゴリが見つかりません。')
+                notes = await channel.guild.create_text_channel('staff-' + os.urandom(4).hex(),
+                    category=category, overwrites=overwrites, reason='Private ticket staff notes')
+                try:
+                    self.store.update(channel.id, notes_channel=notes.id, actor=member.id, event='notes_created')
+                except Exception:
+                    # If registration fails, do not post any consultation details.
+                    await notes.delete(reason='Staff channel registration failed')
+                    raise
+                await notes.send('担当者用の内部メモです。相談者と当事者には閲覧拒否を設定しています。\n'
+                                 '窓口変更時は、相談者の承認後にメモの全履歴も変更先の担当部門へ引き継ぎます。\n'
+                                 '相談チャンネルの完全削除時に、この内部メモも削除します。')
+            await reply(interaction, f'スタッフ専用チャンネル：{notes.mention}')
+
+    async def assign_member(self, interaction, member_id):
+        async with self.close_lock:
+            channel, actor, info = await self.staff_ticket(interaction)
+            if info['status'] == 'archived':
+                raise TicketError('保管中です。先に再開してください。')
+            member = await channel.guild.fetch_member(member_id)
+            if (member.bot or member.id in (info['owner'], info['excluded'])
+                or not any(r.id in DESKS[info['desk']].roles for r in member.roles)
+                or not channel.permissions_for(member).view_channel):
+                raise TicketError('現在の担当部門に所属し、閲覧できる人を選択してください。相談者・当事者・BOTは指定できません。')
+            self.store.update(channel.id, status='active', assignee=member.id,
+                              actor=actor.id, event='assigned', subject_id=member.id)
+            await channel.send(f'担当者を変更しました：<@{member.id}>／状態：対応中', allowed_mentions=discord.AllowedMentions.none())
+            await reply(interaction, '担当者を変更しました。')
+
+    async def show_audit(self, interaction):
+        async with self.close_lock:
+            channel, _, _ = await self.staff_ticket(interaction)
+            rows = self.store.db.execute(
+                'SELECT at,actor,event,desk,subject_id FROM ticket_audit WHERE ticket=? ORDER BY id DESC LIMIT 20', (channel.id,)).fetchall()
+            labels = {'created':'作成', 'claimed':'受付', 'released':'受付解除', 'assigned':'担当変更',
+                      'archived':'対応完了・保管', 'reopened':'再開', 'transferred':'部門変更',
+                      'transition_requested':'権限変更開始', 'transition_applied':'権限変更完了',
+                      'transfer_proposed':'部門変更申請', 'transfer_rejected':'部門変更拒否',
+                      'notes_created':'内部メモ作成', 'notes_opened':'内部メモ表示',
+                      'delete_requested':'完全削除開始', 'deleted':'完全削除',
+                      'channel_removed':'チャンネル削除検知', 'retention_notice':'保管期限通知', 'notes_deleted':'内部メモ削除'}
+            lines = ['操作履歴（最新20件・日本時間）']
+            for at, actor, event, desk, subject in rows:
+                stamp = datetime.fromtimestamp(at, ZoneInfo('Asia/Tokyo')).strftime('%m/%d %H:%M')
+                line = f'{stamp} {labels.get(event,event)}／操作ID:{actor or "BOT"}'
+                if desk: line += f'／窓口:{DESKS[desk].label}'
+                if subject: line += f'／対象ID:{subject}'
+                lines.append(line)
+            # Use an embed to stay comfortably under Discord's 2000-character message cap.
+            await interaction.followup.send(embed=discord.Embed(title='担当者用パネル｜操作履歴',
+                description='\n'.join(lines)[:4000], color=0xB88A69), ephemeral=True)
+
+    async def retention_once(self):
+        if not RETENTION_DAYS:
+            return
+        guild = self.get_guild(GUILD_ID)
+        if not guild:
+            return
+        now = time.time()
+        ids = [r[0] for r in self.store.db.execute(
+            "SELECT channel FROM tickets WHERE status='archived' AND archived_at>0 AND archived_at<=? AND retention_notified<=?",
+            (now - RETENTION_DAYS*86400, now - 86400))]
+        for cid in ids:
+            async with self.close_lock:
+                info = self.store.info(cid)
+                if not info or info['status'] != 'archived':
+                    continue
+                try:
+                    channel = await guild.fetch_channel(cid)
+                    recipients = []
+                    async for member in guild.fetch_members(limit=None):
+                        if (not member.bot and member.id not in (info['owner'], info['excluded'])
+                            and any(r.id in DESKS[info['desk']].roles for r in member.roles)
+                            and channel.permissions_for(member).view_channel):
+                            recipients.append(member)
+                            if len(recipients) >= 20: break
+                    await channel.send(' '.join(m.mention for m in recipients) +
+                        f'\n保管期限（{RETENTION_DAYS}日）を迎えました。担当者用パネルで内容を確認し、必要なら完全削除してください。自動削除は行いません。',
+                        view=CloseView(), allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=recipients))
+                    self.store.update(cid, retention_notified=now, event='retention_notice')
+                except discord.NotFound:
+                    self.store.remove(cid)
+                except Exception as exc:
+                    logger.error('Retention notice failed: %s', type(exc).__name__)
+
+    async def delete_staff_notes(self, channel, info, actor):
+        if not info['notes_channel']:
+            return
+        try:
+            notes = await channel.guild.fetch_channel(info['notes_channel'])
+            await notes.delete(reason='Ticket and staff notes deletion confirmed')
+        except discord.NotFound:
+            pass
+        self.store.update(channel.id, notes_channel=None, actor=actor, event='notes_deleted')
+
+    async def cleanup_orphan_notes(self):
+        guild = self.get_guild(GUILD_ID)
+        if not guild:
+            return
+        for cid, ticket in self.store.db.execute('SELECT channel,ticket FROM orphan_notes').fetchall():
+            try:
+                notes = await guild.fetch_channel(cid)
+                await notes.delete(reason='Parent ticket was deleted')
+            except discord.NotFound:
+                pass
+            except Exception as exc:
+                logger.error('Staff notes cleanup failed: %s', type(exc).__name__)
+                continue
+            self.store.audit(ticket, None, 'notes_deleted')
+            self.store.db.execute('DELETE FROM orphan_notes WHERE channel=?', (cid,))
+            self.store.db.commit()
 
     async def fresh_ticket(self, interaction, handler=False, owner_only=False, allow_pending=False):
         if interaction.guild_id != GUILD_ID:
@@ -345,13 +539,21 @@ class TicketBot(commands.Bot):
                 view_channel=False, read_message_history=False, send_messages=False, send_messages_in_threads=False)
         return overwrites
 
-    async def apply_transition(self, channel, info, target):
+    async def apply_transition(self, channel, info, target, actor=None):
         # Persist the approved target BEFORE the external API call. A crash or
         # ambiguous HTTP failure leaves a recoverable state, never a stale active route.
         overwrites = await self.routing_overwrites(channel.guild, info, target)
-        self.store.update(channel.id, status='updating', pending=json.dumps(target))
+        notes = None
+        notes_overwrites = None
+        if info['notes_channel']:
+            notes = await channel.guild.fetch_channel(info['notes_channel'])
+            notes_overwrites = await self.notes_overwrites(channel.guild, info, target)
+        self.store.update(channel.id, status='updating', pending=json.dumps(target), actor=actor, event='transition_requested')
+        if notes:
+            await notes.edit(overwrites=notes_overwrites, reason='Staff ticket permissions update')
         updated = await channel.edit(overwrites=overwrites, reason='Ticket workflow permission update')
-        self.store.update(channel.id, **target, pending=None)
+        event = 'transferred' if target['desk'] != info['desk'] else ('archived' if target['status'] == 'archived' else 'reopened')
+        self.store.update(channel.id, **target, pending=None, actor=actor, event=event)
         return updated
 
     async def change_archive(self, interaction, archive):
@@ -367,24 +569,29 @@ class TicketBot(commands.Bot):
                 raise TicketError('同時チケット数の上限です。他のチケットを保管してください。')
         target = dict(status='archived' if archive else 'waiting', desk=info['desk'],
                       sensitive=info['sensitive'], assignee=None,
-                      created_at=time.time(), notified_at=0)
-        channel = await self.apply_transition(channel, info, target)
+                      created_at=time.time(), notified_at=0,
+                      archived_at=time.time() if archive else 0, retention_notified=0)
+        channel = await self.apply_transition(channel, info, target, actor=member.id)
         await channel.send('対応完了として保管しました。' if archive else '再開しました。状態：未対応', view=CloseView())
 
-    async def claim(self, interaction):
+    async def claim(self, interaction, release=False):
         async with self.close_lock:
             channel, member, info = await self.fresh_ticket(interaction, handler=True)
             if info['status'] == 'archived':
                 raise TicketError('保管中です。先に再開してください。')
             if info['assignee'] and info['assignee'] != member.id:
                 raise TicketError('別の担当者が受付済みです。')
-            if info['assignee'] == member.id:
-                self.store.update(channel.id, status='waiting', assignee=None, created_at=time.time(), notified_at=0)
+            if release and info['assignee'] != member.id:
+                raise TicketError('自分が担当しているチケットだけを解除できます。')
+            if info['assignee'] == member.id and not release:
+                raise TicketError('すでにあなたが担当しています。解除は担当者用パネルから行ってください。')
+            if release:
+                self.store.update(channel.id, status='waiting', assignee=None, created_at=time.time(), notified_at=0, actor=member.id, event='released')
                 await channel.send('受付を解除しました。状態：未対応')
             else:
                 if member.id == info['owner']:
                     raise TicketError('相談者自身は受付担当になれません。')
-                self.store.update(channel.id, status='active', assignee=member.id)
+                self.store.update(channel.id, status='active', assignee=member.id, actor=member.id, event='claimed')
                 await channel.send(f'受付しました。状態：対応中／担当：<@{member.id}>', allowed_mentions=discord.AllowedMentions.none())
 
     async def send_status(self, interaction):
@@ -398,6 +605,8 @@ class TicketBot(commands.Bot):
     async def reminders(self):
         try:
             await self.remind_once()
+            await self.retention_once()
+            await self.cleanup_orphan_notes()
         except Exception as exc:
             logger.error('Reminder scan failed: %s', type(exc).__name__)
 
@@ -452,9 +661,11 @@ class TicketBot(commands.Bot):
             await channel.send(
                 f"相談者の承認待ち：窓口を「{DESKS[key].label}」へ変更します。\n"
                 '承認すると、このチャンネルの過去の相談内容・添付を含む全履歴を変更先の担当部門に共有します。'
+                '内部メモ用チャンネルがある場合は、そのメモの全履歴も変更先の担当部門へ引き継ぎます。'
                 '元の部門の閲覧許可は外れます（両部門に所属する人と管理者は例外）。当事者の閲覧拒否は維持します。\n'
                 '相談者本人だけが承認・拒否できます。3分で失効します。',
                 view=TransferApproval(info['owner'], info['revision'], key))
+            self.store.audit(channel.id, interaction.user.id, 'transfer_proposed', key)
 
     async def approve_transfer(self, interaction, revision, key):
         async with self.close_lock:
@@ -463,7 +674,7 @@ class TicketBot(commands.Bot):
                 raise TicketError('状態が変更されたため申請が失効しました。改めて申請してください。')
             target = dict(status='waiting', desk=key, sensitive=int(info['sensitive'] or DESKS[key].urgent),
                           assignee=None, created_at=time.time(), notified_at=0)
-            channel = await self.apply_transition(channel, info, target)
+            channel = await self.apply_transition(channel, info, target, actor=interaction.user.id)
             await channel.send(f'相談者の承認により窓口を「{DESKS[key].label}」へ変更しました。状態：未対応', view=CloseView())
 
     async def config_check(self, interaction):
@@ -471,7 +682,7 @@ class TicketBot(commands.Bot):
             or not interaction.user.guild_permissions.manage_guild):
             raise TicketError('サーバー管理権限が必要です。')
         guild = interaction.guild
-        lines = [f'実行環境：{TICKET_ENV}／v0.2.1']
+        lines = [f'実行環境：{TICKET_ENV}／v0.3.0']
         category = guild.get_channel(CATEGORY_ID)
         lines.append('カテゴリ：' + ('OK' if isinstance(category, discord.CategoryChannel) else '見つかりません'))
         if isinstance(category, discord.CategoryChannel):
@@ -501,6 +712,10 @@ class TicketBot(commands.Bot):
             lines.append('削除時ログ：無効')
         pending = self.store.db.execute("SELECT COUNT(*) FROM tickets WHERE status='updating'").fetchone()[0]
         lines.append(f'権限更新未完了：{pending}件（該当チャンネルで /ticket_recover）')
+        orphan_count = self.store.db.execute('SELECT COUNT(*) FROM orphan_notes').fetchone()[0]
+        lines.append(f'内部メモ削除再試行待ち：{orphan_count}件')
+        lines.append(f'連続作成制限：{COOLDOWN_SECONDS}秒（0は無効）')
+        lines.append(f'保管期限：{RETENTION_DAYS}日（0は通知無効・自動削除なし）')
         await reply(interaction, '\n'.join(lines))
 
     async def transcript(self, channel, row):
@@ -627,7 +842,25 @@ class CloseView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label='チケットを閉じる', custom_id='concierge:close:v1', style=discord.ButtonStyle.danger)
+    @discord.ui.button(label='担当する', emoji='🙋', custom_id='concierge:claim:v1', style=discord.ButtonStyle.success)
+    async def claim_ticket(self, interaction, button):
+        async def action():
+            await interaction.client.claim(interaction)
+            await reply(interaction, '担当として受付しました。')
+        await workflow_reply(interaction, action)
+
+    @discord.ui.button(label='担当者用パネル', emoji='🛡️', custom_id='concierge:staffpanel:v1', style=discord.ButtonStyle.secondary)
+    async def staff_panel(self, interaction, button):
+        async def action():
+            async with interaction.client.close_lock:
+                _, _, info = await interaction.client.staff_ticket(interaction)
+                embed = discord.Embed(title='担当者用パネル',
+                    description='担当者だけが操作できます。\n内部メモ・担当交代・操作履歴・窓口変更・保管後の操作をまとめています。', color=0xB88A69)
+                embed.add_field(name='状態', value=STATE_LABELS.get(info['status'], '不明'))
+                await interaction.followup.send(embed=embed, view=StaffPanel(interaction.user.id), ephemeral=True)
+        await workflow_reply(interaction, action)
+
+    @discord.ui.button(label='チケットを閉じる', emoji='🔒', custom_id='concierge:close:v1', style=discord.ButtonStyle.danger)
     async def close_ticket(self, interaction, button):
         try:
             interaction.client.authorize_close(interaction)
@@ -637,37 +870,127 @@ class CloseView(discord.ui.View):
             await reply(interaction, str(exc))
 
 
-    @discord.ui.button(label='受付／解除', custom_id='concierge:claim:v1', style=discord.ButtonStyle.primary)
-    async def claim_ticket(self, interaction, button):
-        async def action():
-            await interaction.client.claim(interaction)
-            await reply(interaction, '受付状況を更新しました。')
-        await workflow_reply(interaction, action)
+class LegacyControls(discord.ui.View):
+    """Keep old messages working after restart; new tickets use the three-button row."""
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    @discord.ui.button(label='対応状況', custom_id='concierge:status:v1', style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label='対応状況', custom_id='concierge:status:v1')
     async def status_ticket(self, interaction, button):
         await workflow_reply(interaction, lambda: interaction.client.send_status(interaction))
 
-    @discord.ui.button(label='再開する', custom_id='concierge:reopen:v1', style=discord.ButtonStyle.success)
+    @discord.ui.button(label='再開する', custom_id='concierge:reopen:v1')
     async def reopen_ticket(self, interaction, button):
-        async def action():
-            bot = interaction.client
+        await staff_action(interaction, 'reopen')
+
+    @discord.ui.button(label='窓口を変更', custom_id='concierge:transfer:v1')
+    async def transfer_ticket(self, interaction, button):
+        await staff_action(interaction, 'transfer')
+
+
+class StaffPanel(discord.ui.View):
+    def __init__(self, requester):
+        super().__init__(timeout=180)
+        self.requester = requester
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.requester:
+            await reply(interaction, 'パネルを開いた担当者本人だけが操作できます。')
+            return False
+        # Each action also revalidates membership under the operation lock.
+        try:
+            await interaction.client.staff_ticket(interaction)
+            return True
+        except TicketError as exc:
+            await reply(interaction, str(exc))
+            return False
+
+    @discord.ui.button(label='スタッフ専用チャンネル', emoji='🛡️', style=discord.ButtonStyle.secondary, row=0)
+    async def notes(self, interaction, button):
+        await workflow_reply(interaction, lambda: interaction.client.staff_notes(interaction))
+
+    @discord.ui.button(label='担当者を変更', style=discord.ButtonStyle.primary, row=0)
+    async def assign(self, interaction, button):
+        await staff_action(interaction, 'assign')
+
+    @discord.ui.button(label='受付を解除', style=discord.ButtonStyle.secondary, row=0)
+    async def release(self, interaction, button):
+        await staff_action(interaction, 'release')
+
+    @discord.ui.button(label='操作履歴', style=discord.ButtonStyle.secondary, row=1)
+    async def audit(self, interaction, button):
+        await workflow_reply(interaction, lambda: interaction.client.show_audit(interaction))
+
+    @discord.ui.button(label='対応状況', style=discord.ButtonStyle.secondary, row=1)
+    async def status(self, interaction, button):
+        await staff_action(interaction, 'status')
+
+    @discord.ui.button(label='窓口を変更', style=discord.ButtonStyle.secondary, row=1)
+    async def transfer(self, interaction, button):
+        await staff_action(interaction, 'transfer')
+
+    @discord.ui.button(label='再開する', style=discord.ButtonStyle.success, row=2)
+    async def reopen(self, interaction, button):
+        await staff_action(interaction, 'reopen')
+
+    @discord.ui.button(label='完全削除', style=discord.ButtonStyle.danger, row=2)
+    async def delete(self, interaction, button):
+        await staff_action(interaction, 'delete')
+
+
+async def staff_action(interaction, action):
+    async def perform():
+        bot = interaction.client
+        if action == 'reopen':
             async with bot.create_lock:
                 async with bot.close_lock:
+                    await bot.staff_ticket(interaction)
                     await bot.change_archive(interaction, False)
-                    await reply(interaction, 'チケットを再開しました。')
-        await workflow_reply(interaction, action)
+                    await reply(interaction, '再開しました。相談者の閲覧を復元しました。')
+        elif action == 'release':
+            await bot.staff_ticket(interaction)
+            await bot.claim(interaction, release=True)
+            await reply(interaction, '受付を解除しました。')
+        elif action == 'status':
+            await bot.staff_ticket(interaction)
+            await bot.send_status(interaction)
+        else:
+            async with bot.close_lock:
+                _, _, info = await bot.staff_ticket(interaction)
+                if action == 'assign':
+                    if info['status'] == 'archived': raise TicketError('先に再開してください。')
+                    await interaction.followup.send('同じ担当部門の交代先を選択してください。', view=AssignView(interaction.user.id), ephemeral=True)
+                elif action == 'transfer':
+                    if info['status'] == 'archived': raise TicketError('先に再開してください。')
+                    await interaction.followup.send('窓口変更は相談者の承認後に実行します。',
+                        view=TransferView(interaction.user.id, info['desk']), ephemeral=True)
+                elif action == 'delete':
+                    if info['status'] != 'archived': raise TicketError('先にチケットを閉じて保管してください。')
+                    await interaction.followup.send('相談内容と内部メモを完全削除します。元に戻せません。操作履歴のメタデータは残ります。\n'
+                        '緊急相談・ログ無効時は相談記録を外部保存しません。本当に削除しますか？',
+                        view=ConfirmDelete(interaction.user.id, info['revision']), ephemeral=True)
+    await workflow_reply(interaction, perform)
 
-    @discord.ui.button(label='窓口を変更', custom_id='concierge:transfer:v1', style=discord.ButtonStyle.secondary)
-    async def transfer_ticket(self, interaction, button):
-        async def action():
-            async with interaction.client.close_lock:
-                _, _, info = await interaction.client.fresh_ticket(interaction)
-                if info['status'] == 'archived':
-                    raise TicketError('先に再開してください。')
-                await interaction.followup.send('変更先を選択してください。相談者の承認後に全履歴を共有します。',
-                    view=TransferView(interaction.user.id, info['desk']), ephemeral=True)
-        await workflow_reply(interaction, action)
+
+class AssignSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder='交代先の担当者を選択', min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        await workflow_reply(interaction, lambda: interaction.client.assign_member(interaction, self.values[0].id))
+
+
+class AssignView(discord.ui.View):
+    def __init__(self, requester):
+        super().__init__(timeout=180)
+        self.requester = requester
+        self.add_item(AssignSelect())
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.requester:
+            await reply(interaction, '担当者変更を開始した本人だけが操作できます。')
+            return False
+        return True
 
 
 async def workflow_reply(interaction, action):
@@ -732,6 +1055,7 @@ class TransferApproval(discord.ui.View):
     async def reject(self, interaction, button):
         self.used = True
         self.stop()
+        interaction.client.store.audit(interaction.channel_id, interaction.user.id, 'transfer_rejected', self.key)
         await interaction.response.edit_message(content='窓口変更は相談者により拒否されました。閲覧範囲は変更していません。', view=None)
 
 
@@ -758,7 +1082,10 @@ class ConfirmDelete(discord.ui.View):
                 if info['status'] != 'archived' or info['revision'] != self.revision:
                     raise TicketError('状態が変更されました。保管後に改めて削除してください。')
                 await bot.transcript(channel, (info['owner'], info['desk'], info['excluded']))
+                bot.store.audit(channel.id, interaction.user.id, 'delete_requested')
+                await bot.delete_staff_notes(channel, info, interaction.user.id)
                 await channel.delete(reason='Archived ticket deletion confirmed')
+                bot.store.audit(channel.id, interaction.user.id, 'deleted')
                 bot.store.remove(channel.id)
                 await reply(interaction, 'チケットを完全削除しました。')
         await workflow_reply(interaction, action)
@@ -852,7 +1179,7 @@ async def ticket_delete(interaction: discord.Interaction):
             if info['status'] != 'archived':
                 raise TicketError('先に「チケットを閉じる」で保管してください。')
             await interaction.followup.send(
-                'このチャンネルと全履歴を完全削除します。元に戻せません。'
+                'このチャンネルと内部メモの全履歴を完全削除します。元に戻せません。操作履歴のメタデータは残ります。'
                 '緊急相談やログ無効時は記録を保存しません。本当に削除しますか？',
                 view=ConfirmDelete(interaction.user.id, info['revision']), ephemeral=True)
     await workflow_reply(interaction, action)
@@ -876,7 +1203,7 @@ async def ticket_recover(interaction: discord.Interaction):
                 channel = await interaction.guild.fetch_channel(interaction.channel_id)
                 if not channel.permissions_for(interaction.user).view_channel:
                     raise TicketError('閲覧権限がありません。')
-                await bot.apply_transition(channel, info, json.loads(info['pending']))
+                await bot.apply_transition(channel, info, json.loads(info['pending']), actor=interaction.user.id)
                 await reply(interaction, '承認済みの権限更新を再実行しました。/ticket_status で確認してください。')
     await workflow_reply(interaction, action)
 
